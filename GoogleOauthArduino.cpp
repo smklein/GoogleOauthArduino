@@ -20,7 +20,8 @@
 #include "GoogleOauthArduino.h"
 #include <ArduinoJson.h>
 
-int GoogleAuthenticator::QueryUserCode(WiFiClientSecure& client, const String& Scope) {
+int GoogleAuthenticator::QueryUserCode(WiFiClientSecure& client, const String& Scope,
+                                       GoogleAuthRequest* out) {
   Serial.println("Querying for device and user codes");
 
   String command = "client_id=" + ClientID_ + "&scope=" + Scope;
@@ -41,42 +42,53 @@ int GoogleAuthenticator::QueryUserCode(WiFiClientSecure& client, const String& S
     return -1;
   }
   Serial.println("Parsed JSON successfully");
-  if (!response.containsKey("device_code") || !response.containsKey("user_code")) {
+  if (!response.containsKey("device_code") ||
+      !response.containsKey("user_code") ||
+      !response.containsKey("verification_url") ||
+      !response.containsKey("expires_in") ||
+      !response.containsKey("interval")) {
     Serial.println("JSON does not contain desired codes");
     return -1;
   }
-  strncpy(oauthDeviceCode, response["device_code"], sizeof(oauthDeviceCode));
-  strncpy(oauthUserCode, response["user_code"], sizeof(oauthUserCode));
+  strncpy(out->oauthDeviceCode, response["device_code"], sizeof(out->oauthDeviceCode));
+  strncpy(out->oauthUserCode, response["user_code"], sizeof(out->oauthUserCode));
+  strncpy(out->verifyURL, response["verification_url"], sizeof(out->verifyURL));
+
+  auto now = millis();
+  out->expirationMs = now + response["expires_in"].as<unsigned long>() * 1000;
+  out->intervalMs = response["interval"].as<unsigned long>() * 1000;
+  out->nextMs = now + out->intervalMs;
 
   Serial.print("Device Code: ");
-  Serial.println(String(oauthDeviceCode));
+  Serial.println(String(out->oauthDeviceCode));
 
   Serial.print("User Code: ");
-  Serial.println(String(oauthUserCode));
+  Serial.println(String(out->oauthUserCode));
 
-  /*
-     https://developers.google.com/identity/protocols/OAuth2ForDevices
-     TODO(smklein): Parse the following
-     - "device_code": Will be used to refer to device asking for access
-     - "user_code": Must be displayed to user, presented at verification url
-     - "verification_url": Must be accessed by user
-     - "expires_in": Restart after this amount of time
-     - "interval": Interval this device should (minimally) wait between polling
-       for authenticated access
-   */
+  Serial.print("Verify URL: ");
+  Serial.println(String(out->verifyURL));
 
+  // https://developers.google.com/identity/protocols/OAuth2ForDevices
   return 0;
 }
 
-int GoogleAuthenticator::QueryAccessToken(WiFiClientSecure& client) {
+int GoogleAuthenticator::QueryAccessToken(WiFiClientSecure& client,
+                                          GoogleAuthRequest* authRequest) {
+  auto now = millis();
+  if (now < authRequest->nextMs) {
+    return -1;
+  } else if (now > authRequest->expirationMs) {
+    Serial.println("Skipping polling request; expired...");
+    return -1;
+  }
   Serial.println("Polling for authentication confirmation, access token");
+  authRequest->nextMs = now + authRequest->intervalMs;
+
   String command =
     "client_id=" + ClientID_ + \
     "&client_secret=" + ClientSecret_ + \
-    "&grant_type=http://oauth.net/grant_type/device/1.0";
-
-  command += "&code=" + String(oauthDeviceCode);
-
+    "&grant_type=http://oauth.net/grant_type/device/1.0" + \
+    "&code=" + authRequest->DeviceCode();
   String responseString = sendPostCommand(client, GAPI_HOST, GAPI_SSL_PORT,
                                           "/oauth2/v4/token", command);
 
@@ -99,23 +111,73 @@ int GoogleAuthenticator::QueryAccessToken(WiFiClientSecure& client) {
     return -1;
   }
 
-  if (!response.containsKey("access_token")) {
+  if (!response.containsKey("access_token") ||
+      !response.containsKey("refresh_token") ||
+      !response.containsKey("expires_in")) {
     Serial.println("Response does not contain access token\n");
     return -1;
   }
   strncpy(accessToken, response["access_token"], sizeof(accessToken));
+  strncpy(refreshToken, response["refresh_token"], sizeof(refreshToken));
+  expirationMs = millis() + response["expires_in"].as<unsigned long>() * 1000;
 
   Serial.print("Access Token: ");
   Serial.println(String(accessToken));
+  Serial.print("Expiration time: ");
+  Serial.println(response["expires_in"].as<String>());
   /*
      https://developers.google.com/identity/protocols/OAuth2ForDevices
      TODO(smklein): Parse the following
-     - "access_token": Used for future gcal requests
      - "refresh_token": Mechanism to refresh access token
         TODO: do this too; store in EEPROM?
         https://github.com/esp8266/Arduino/blob/master/libraries/EEPROM
-     - "expires_in": Lifetime in seconds
    */
+  return 0;
+}
+
+int GoogleAuthenticator::QueryRefresh(WiFiClientSecure& client) {
+  auto now = millis();
+  if (now < expirationMs) {
+    return -1;
+  }
+  Serial.println("Refreshing Token");
+
+  String command =
+    "client_id=" + ClientID_ + \
+    "&client_secret=" + ClientSecret_ + \
+    "&refresh_token=" + String(refreshToken) + \
+    "&grant_type=refresh_token";
+  String responseString = sendPostCommand(client, GAPI_HOST, GAPI_SSL_PORT,
+                                          "/oauth2/v4/token", command);
+  if (responseString == "") {
+    return -1;
+  }
+
+  DynamicJsonBuffer jsonBuffer;
+  JsonObject& response = jsonBuffer.parseObject(responseString);
+  if (!response.success()) {
+    Serial.println("Failed to parse response");
+    return -1;
+  }
+  Serial.println("Parsed JSON successfully");
+
+  if (response.containsKey("error")) {
+    String responseError = response["error"];
+    Serial.print("Cannot refresh token due to error: ");
+    Serial.println(responseError);
+    return -1;
+  }
+
+  if (!response.containsKey("access_token") ||
+      !response.containsKey("expires_in")) {
+    Serial.println("Response does not contain access token\n");
+    return -1;
+  }
+  strncpy(accessToken, response["access_token"], sizeof(accessToken));
+  expirationMs = millis() + response["expires_in"].as<unsigned long>() * 1000;
+
+  Serial.print("Access Token: ");
+  Serial.println(String(accessToken));
   return 0;
 }
 

@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <EEPROM.h>
 #include <WString.h>
 #include <WiFiClientSecure.h>
 
@@ -27,6 +28,42 @@
 
 #define GAPI_HOST "www.googleapis.com"
 #define GAPI_SSL_PORT 443
+
+// Forward declaration so it can manipulate the
+// internals of the Authentication Request.
+class GoogleAuthenticator;
+
+class GoogleAuthRequest {
+  friend class GoogleAuthenticator;
+public:
+  const String DeviceCode() const { return String(oauthDeviceCode); }
+  const String UserCode() const { return String(oauthUserCode); }
+  const char* UserCodeCStr() const { return oauthUserCode; }
+  const String VerifyURL() const { return String(verifyURL); }
+  const char* VerifyURLCStr() const { return verifyURL; }
+
+private:
+  // Value uniquely assigned to the current device
+  char oauthDeviceCode[1024];
+  // Case-sensitive value that must be inputted
+  // manually from a user on a trusted device
+  char oauthUserCode[128];
+
+  // URL at which the user must input the UserCode
+  char verifyURL[1024];
+
+  // Time at which the authentication request will
+  // become invalid.
+  // May be compared directly with "millis".
+  unsigned long expirationMs;
+
+  // Don't bother issuing a request until this time passes.
+  // May be compared directly with "millis".
+  unsigned long nextMs;
+
+  // How long to wait before next query (ms)
+  unsigned long intervalMs;
+};
 
 class GoogleAuthenticator {
 public:
@@ -38,36 +75,50 @@ public:
   // Begins authorization process for a client to access
   // a particular scope.
   //
-  // - Scope: Describes subcomponent of Google API which
+  // Scope: Describes subcomponent of Google API which
   // will be accessed. For a full list, refer to:
   // https://developers.google.com/identity/protocols/googlescopes
   //
   // On success, returns 0.
-  // Additionally, "DeviceCode" and "UserCode" will become
-  // available after this function returns success.
-  int QueryUserCode(WiFiClientSecure& client, const String& Scope);
+  int QueryUserCode(WiFiClientSecure& client, const String& Scope,
+                    GoogleAuthRequest* out);
 
   // AFTER the user has manually inputted the "UserCode" at the verification
   // URL from "QueryUserCode", this function may return "0" if it succesfully
   // sets the AccessToken.
-  int QueryAccessToken(WiFiClientSecure& client);
+  //
+  // If the authRequest is not ready to be queried, no request is sent,
+  // and -1 is returned.
+  int QueryAccessToken(WiFiClientSecure& client, GoogleAuthRequest* authRequest);
 
-  const String DeviceCode() const { return String(oauthDeviceCode); }
-  const String UserCode() const { return String(oauthUserCode); }
+  // If the access token has expired, acquire another
+  // one using the provided refresh token.
+  int QueryRefresh(WiFiClientSecure& client);
+
+  int EEPROMLength() { return sizeof(refreshToken); }
+  int EEPROMStore(int addr) {
+    EEPROM.begin(512);
+    EEPROM.put(addr, refreshToken);
+    EEPROM.end();
+    return 0;
+  }
+  int EEPROMAcquire(int addr) {
+    EEPROM.begin(512);
+    EEPROM.get(addr, refreshToken);
+    EEPROM.end();
+    return 0;
+  }
+
   const String AccessToken() const { return String(accessToken); }
-
 private:
   const String ClientID_;
   const String ClientSecret_;
 
-  // Value uniquely assigned to the current device
-  char oauthDeviceCode[1024]{};
-  // Case-sensitive value that must be inputted
-  // manually from a user on a trusted device
-  char oauthUserCode[128]{};
   // Token which, upon success, may be used to
   // access authorized APIs
-  char accessToken[1024]{};
+  char accessToken[256]{};
+  char refreshToken[256]{};
+  unsigned long expirationMs = 0;
 };
 
 // TODO(smklein): Maybe move somewhere else...
